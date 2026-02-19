@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "main.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        audio_preprocessor
+        model
+        driver
+        esp_timer
+        freertos
+        log
+)
