@@ -3,7 +3,7 @@
  * @brief Pre-computed triangular mel filterbank for 40-channel log-mel features.
  *
  * Follows the HTK convention used by the TFLite Micro Micro Speech pipeline:
- *   - Frequency range  : 20 Hz – 7600 Hz
+ *   - Frequency range  : 300 Hz – 8000 Hz
  *   - Filterbank count : 40
  *   - FFT bins         : 257  (512-pt FFT)
  *   - Sample rate      : 16000 Hz
@@ -22,8 +22,8 @@
 static constexpr int   kMFB_NumBands    = 40;
 static constexpr int   kMFB_NumBins     = 257;   // kFftSize/2 + 1
 static constexpr int   kMFB_SampleRate  = 16000;
-static constexpr float kMFB_LowFreq     = 20.0f;
-static constexpr float kMFB_HighFreq    = 7600.0f;
+static constexpr float kMFB_LowFreq     = 300.0f;
+static constexpr float kMFB_HighFreq    = 8000.0f;
 
 // ── Per-bin contribution descriptor ──────────────────────────
 struct MelBinEntry {

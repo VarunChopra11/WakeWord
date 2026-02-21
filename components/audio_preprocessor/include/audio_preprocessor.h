@@ -28,10 +28,6 @@ static constexpr int kFftSize           = 512;   // next power-of-2 ≥ 480
 static constexpr int kFftBins           = kFftSize / 2 + 1;                          // 257
 static constexpr int kNumMels           = 40;
 
-// INT8 quantisation parameters (matched to model input expectations)
-static constexpr float kFeatureScale    = 1.0f / 52.0f;
-static constexpr int   kFeatureZp       = -30;
-
 // ─────────────────────────────────────────────────────────────
 //  Class
 // ─────────────────────────────────────────────────────────────
@@ -62,6 +58,12 @@ public:
     /** Reset internal ring-buffer and stride counter. */
     void Reset();
 
+    /**
+     * @brief Set INT8 quantisation parameters from the model's input tensor.
+     * Must be called after Init() and before the first ProcessSamples().
+     */
+    void SetQuantizationParams(float scale, int zero_point);
+
 private:
     // ── Ring buffer ─────────────────────────────────────────
     int16_t* ring_buf_     = nullptr;   ///< Allocated in PSRAM
@@ -79,6 +81,10 @@ private:
 
     // ── Stride management ────────────────────────────────────
     int      samples_since_last_slice_ = 0;
+
+    // ── Quantisation parameters (set from model) ─────────────
+    float    input_scale_      = 1.0f;
+    int      input_zero_point_ = 0;
 
     // ── Internal helpers ─────────────────────────────────────
     void   ComputeWindow();

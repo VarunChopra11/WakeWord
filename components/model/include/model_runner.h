@@ -71,6 +71,16 @@ public:
      */
     uint8_t GetOutputProbability();
 
+    /**
+     * @brief Get the input tensor's quantisation scale.
+     */
+    float GetInputScale();
+
+    /**
+     * @brief Get the input tensor's quantisation zero-point.
+     */
+    int GetInputZeroPoint();
+
 private:
     // ── Tensor arena (PSRAM) ─────────────────────────────────
     uint8_t* tensor_arena_ = nullptr;

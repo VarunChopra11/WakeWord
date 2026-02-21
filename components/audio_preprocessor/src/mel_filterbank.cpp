@@ -1,6 +1,6 @@
 /**
  * @file mel_filterbank.cpp
- * @brief Pre-computed triangular mel filterbank — 40 bands, 20–7600 Hz.
+ * @brief Pre-computed triangular mel filterbank — 40 bands, 300–8000 Hz.
  *
  * Algorithm:
  *   1. Convert frequency limits to mel scale (HTK formula).

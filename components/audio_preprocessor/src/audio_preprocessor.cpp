@@ -116,6 +116,21 @@ void AudioPreprocessor::Reset()
 }
 
 // ─────────────────────────────────────────────────────────────
+//  SetQuantizationParams
+// ─────────────────────────────────────────────────────────────
+void AudioPreprocessor::SetQuantizationParams(float scale, int zero_point)
+{
+    if (scale == 0.0f) {
+        ESP_LOGW(TAG, "Quantization scale is 0 — defaulting to 1.0");
+        scale = 1.0f;
+    }
+    input_scale_      = scale;
+    input_zero_point_ = zero_point;
+    ESP_LOGI(TAG, "Quantization params set: scale=%f, zero_point=%d",
+             scale, zero_point);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  ProcessSamples — main entry point
 // ─────────────────────────────────────────────────────────────
 bool AudioPreprocessor::ProcessSamples(const int16_t* samples,
@@ -194,8 +209,11 @@ void AudioPreprocessor::ApplyWindowAndFFT(int ring_offset)
     int read_pos = ring_head_ % kWindowSamples;
 
     for (int i = 0; i < kWindowSamples; ++i) {
-        float sample_f = static_cast<float>(ring_buf_[read_pos]) /
-                         32768.0f;   // Normalise to [-1, +1)
+        // Keep raw int16 scale — do NOT normalise to [-1,+1).
+        // The model was trained with unnormalised int16 audio.
+        // ln(mel_energy) of unnormalised samples falls in [0,26]
+        // which matches the model's input quantisation range.
+        float sample_f = static_cast<float>(ring_buf_[read_pos]);
         fft_in_[2 * i]     = sample_f * window_coeff_[i]; // real
         fft_in_[2 * i + 1] = 0.0f;                        // imag
         read_pos = (read_pos + 1) % kWindowSamples;
@@ -203,41 +221,50 @@ void AudioPreprocessor::ApplyWindowAndFFT(int ring_offset)
     // Bins kWindowSamples…kFftSize-1 remain zero (zero-padding)
 }
 
-/** Compute magnitude-squared spectrum from complex FFT output. */
+/**
+ * Compute magnitude-squared spectrum from complex FFT output.
+ *
+ * After dsps_cplx2reC_fc32 the layout is:
+ *   data[0]         = Re(X[0])     (DC, purely real)
+ *   data[1]         = Re(X[N/2])   (Nyquist, purely real)
+ *   data[2k..2k+1]  = Re(X[k]), Im(X[k])  for k = 1 … N/2-1
+ */
 void AudioPreprocessor::ComputePowerSpectrum()
 {
-    for (int k = 0; k < kFftBins; ++k) {
+    // DC bin (purely real)
+    power_spec_[0] = fft_out_[0] * fft_out_[0];
+
+    // Bins 1 … N/2-1
+    for (int k = 1; k < kFftBins - 1; ++k) {
         float re = fft_out_[2 * k];
         float im = fft_out_[2 * k + 1];
         power_spec_[k] = re * re + im * im;
     }
+
+    // Nyquist bin (purely real, packed at data[1])
+    power_spec_[kFftBins - 1] = fft_out_[1] * fft_out_[1];
 }
 
 /**
- * Apply log1p compression to mel band energies and quantise to INT8.
+ * Apply log compression to mel band energies and quantise to INT8.
  *
- * Compression: y = log10(1 + energy)  — avoids log(0)
+ * Compression: y = ln(max(energy, 1e-6))  — natural log, floor to avoid log(0)
  * Quantisation: int8 = clamp(round(y / scale) + zero_point, -128, 127)
+ *               scale and zero_point are read from the model's input tensor.
  */
 void AudioPreprocessor::QuantiseToInt8(int8_t* out)
 {
-    // Find dynamic range for per-frame normalisation (optional stabiliser)
-    float max_energy = 1e-6f;  // Prevent division by zero
     for (int i = 0; i < kNumMels; ++i) {
-        if (mel_energies_[i] > max_energy) max_energy = mel_energies_[i];
-    }
+        // Log compression: natural log with floor to prevent log(0)
+        float log_energy = logf(fmaxf(mel_energies_[i], 1e-6f));
 
-    for (int i = 0; i < kNumMels; ++i) {
-        // Log compression with a floor at kFeatureScale to avoid -∞
-        float log_energy = log10f(1.0f + mel_energies_[i]);
+        // TFLite INT8 quantisation: q = round(value / scale) + zero_point
+        int32_t quantized = static_cast<int32_t>(
+            roundf(log_energy / input_scale_)) + input_zero_point_;
 
-        // Scale and shift to INT8 range (matched to model's input quantisation)
-        float scaled = (log_energy / kFeatureScale) + kFeatureZp;
-
-        // Clamp to [-128, 127]
-        int rounded = static_cast<int>(scaled + 0.5f);
-        if (rounded >  127) rounded =  127;
-        if (rounded < -128) rounded = -128;
-        out[i] = static_cast<int8_t>(rounded);
+        // Clamp to INT8 range [-128, 127]
+        if (quantized >  127) quantized =  127;
+        if (quantized < -128) quantized = -128;
+        out[i] = static_cast<int8_t>(quantized);
     }
 }

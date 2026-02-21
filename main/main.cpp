@@ -154,17 +154,9 @@ static void inference_task(void* /*arg*/)
     static int16_t  pcm_buf[kStrideSamples];     // 16-bit Mono
     static int8_t   features[kNumMelChannels];
 
-    // Filter state
-    static float dc_offset = 0.0f;
-    const float  dc_alpha  = 0.95f; 
-
-    // ── TUNING PARAMETER ──────────────────────────────────────────
-    const int32_t kGainShift = 12; // Adjusted for optimal volume
-    // ──────────────────────────────────────────────────────────────
-
     static int debug_timer = 0;
 
-    ESP_LOGI(TAG, "Streaming task started (Gain Tuned to >> 12)");
+    ESP_LOGI(TAG, "Streaming task started");
 
     while (true) {
         size_t bytes_read = 0;
@@ -186,24 +178,16 @@ static void inference_task(void* /*arg*/)
         int32_t signal_max_ac = 0; 
 
         for (int i = 0; i < frames_read; i++) {
-            // LEFT Channel: raw_buf[i * 2]
-            // If you get NO signal, try RIGHT: raw_buf[i * 2 + 1]
-            int32_t raw = raw_buf[i * 2]; 
+            // INMP441: 24-bit data left-justified in 32-bit word.
+            // Left channel (INMP441 L/R pin = GND).
+            int32_t raw = raw_buf[i * 2];
 
-            // DC Removal
-            dc_offset = (dc_alpha * dc_offset) + ((1.0f - dc_alpha) * (float)raw);
-            float centered = (float)raw - dc_offset;
+            // Convert 32-bit I2S → 16-bit PCM (take upper 16 bits)
+            int16_t sample = static_cast<int16_t>(raw >> 16);
+            pcm_buf[i] = sample;
 
-            // Apply Gain
-            int32_t amplified = (int32_t)centered >> kGainShift;
-
-            // Clamp
-            if (amplified > 32767)  amplified = 32767;
-            if (amplified < -32768) amplified = -32768;
-
-            pcm_buf[i] = (int16_t)amplified;
-
-            if (abs(amplified) > signal_max_ac) signal_max_ac = abs(amplified);
+            int32_t abs_val = sample < 0 ? -sample : sample;
+            if (abs_val > signal_max_ac) signal_max_ac = abs_val;
         }
 
         // 3. Generate Features
@@ -212,7 +196,7 @@ static void inference_task(void* /*arg*/)
         );
 
         if (!slice_ready) {
-            vTaskDelay(1);
+            led_tick();
             continue;
         }
 
@@ -237,7 +221,10 @@ static void inference_task(void* /*arg*/)
             else if (signal_max_ac < 28000) status = "GOOD LEVEL (Target)";
             else                            status = "CLIPPING (Too Loud)";
             
-            ESP_LOGI(TAG, "Vol: %5ld | Prob: %3u | %s", signal_max_ac, prob, status);
+            ESP_LOGI(TAG, "Vol: %5ld | Prob: %3u | feat[0..3]: %d,%d,%d,%d | %s",
+                     signal_max_ac, prob,
+                     features[0], features[1], features[2], features[3],
+                     status);
         }
 
         if (prob > kDetectThresh) {
@@ -246,7 +233,6 @@ static void inference_task(void* /*arg*/)
         }
 
         led_tick();
-        vTaskDelay(1);
     }
 }
 
@@ -274,6 +260,11 @@ extern "C" void app_main()
         ESP_LOGE(TAG, "ModelRunner init failed — halting");
         esp_restart();
     }
+
+    // ── Pass quantisation params from model → preprocessor ──
+    float in_scale = s_model->GetInputScale();
+    int   in_zp    = s_model->GetInputZeroPoint();
+    s_preprocessor->SetQuantizationParams(in_scale, in_zp);
 
     // ── I2S ──────────────────────────────────────────────────
     i2s_init();

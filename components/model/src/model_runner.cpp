@@ -161,6 +161,11 @@ bool ModelRunner::Init()
              output->dims->data[0], output->dims->data[1],
              output->type);
 
+    ESP_LOGI(TAG, "  Input  quant: scale=%f, zero_point=%d",
+             input->params.scale, input->params.zero_point);
+    ESP_LOGI(TAG, "  Output quant: scale=%f, zero_point=%d",
+             output->params.scale, output->params.zero_point);
+
     // Validate expected shape [1,1,40]
     if (input->dims->size != 3 ||
         input->dims->data[0] != 1 ||
@@ -211,6 +216,20 @@ uint8_t ModelRunner::GetOutputProbability()
         return 0;
     }
     return output->data.uint8[0];
+}
+
+float ModelRunner::GetInputScale()
+{
+    TfLiteTensor* input = interpreter_->input(0);
+    if (!input) return 1.0f;
+    return input->params.scale;
+}
+
+int ModelRunner::GetInputZeroPoint()
+{
+    TfLiteTensor* input = interpreter_->input(0);
+    if (!input) return 0;
+    return input->params.zero_point;
 }
 
 // ─────────────────────────────────────────────────────────────
