@@ -69,7 +69,7 @@ bool ModelRunner::Init()
                  kTensorArenaSize / 1024);
         return false;
     }
-    ESP_LOGI(TAG, "  Arena @ %p", static_cast<void*>(tensor_arena_));
+    ESP_LOGI(TAG, "  Arena @ %p (PSRAM)", static_cast<void*>(tensor_arena_));
 
     // ── 2. Verify model flatbuffer ────────────────────────────
     model_ = tflite::GetModel(g_model_data);
@@ -239,4 +239,7 @@ void ModelRunner::RegisterOps()
     op_resolver_->AddVarHandle();
     op_resolver_->AddReadVariable();
     op_resolver_->AddAssignVariable();
+    op_resolver_->AddMul();
+    op_resolver_->AddAdd();
+    op_resolver_->AddSub();
 }

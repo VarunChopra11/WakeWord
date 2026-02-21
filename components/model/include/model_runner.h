@@ -83,7 +83,7 @@ private:
 
     // ── Op resolver — ops used by MicroWakeWord ──────────────
     // We use a fixed-size resolver; tune the template param to the op count.
-    using OpResolver = tflite::MicroMutableOpResolver<17>;
+    using OpResolver = tflite::MicroMutableOpResolver<24>;
     OpResolver* op_resolver_ = nullptr;
 
     void RegisterOps();
