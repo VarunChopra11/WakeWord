@@ -8,6 +8,7 @@ idf_component_register(
         model
         driver
         esp_timer
+        esp_system
         freertos
         log
 )

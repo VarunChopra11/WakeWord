@@ -57,6 +57,16 @@ CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
 # --- Newlib ---
 CONFIG_NEWLIB_STDOUT_LINE_ENDING_CRLF=n
 
+# --- Task Watchdog ---
+# MicroWakeWord inference (CONV_2D heavy) may exceed the default 5 s
+# timeout in a single Invoke() call.  The inference task is pinned to
+# Core 1 at priority 5, which starves IDLE1.  Disable IDLE1 TWDT
+# monitoring; the inference task subscribes itself and feeds the WDT
+# manually.  Timeout raised to 30 s as a safety net.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
 # --- Heap ---
 CONFIG_HEAP_POISONING_DISABLED=y
 CONFIG_HEAP_TRACING_STANDALONE=n

@@ -21,6 +21,7 @@
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 
 #include "audio_preprocessor.h"
 #include "model_runner.h"
@@ -146,6 +147,13 @@ static void i2s_init()
 // ─────────────────────────────────────────────────────────────
 static void inference_task(void* /*arg*/)
 {
+    // ── Subscribe this task to the Task Watchdog Timer ────────
+    //
+    // IDLE1 monitoring is disabled via sdkconfig (the inference task
+    // permanently hogs Core 1 at priority 5, starving IDLE1).  Instead
+    // this task feeds the WDT itself before and after every Invoke().
+    esp_task_wdt_add(NULL);
+
     // PCM read buffer: 160 samples × 2 bytes = 320 bytes
     static int16_t  pcm_buf[kStrideSamples];
     static int8_t   features[kNumMelChannels];
@@ -163,8 +171,12 @@ static void inference_task(void* /*arg*/)
             portMAX_DELAY
         );
 
+        // Feed WDT after the potentially long blocking I2S read
+        esp_task_wdt_reset();
+
         if (err != ESP_OK || bytes_read == 0) {
             ESP_LOGW(TAG, "I2S read error: %s", esp_err_to_name(err));
+            vTaskDelay(1);
             continue;
         }
 
@@ -176,7 +188,8 @@ static void inference_task(void* /*arg*/)
         );
 
         if (!slice_ready) {
-            // Not enough audio buffered yet — keep accumulating
+            // Not enough audio buffered yet — yield and loop back
+            vTaskDelay(1);
             continue;
         }
 
@@ -185,10 +198,18 @@ static void inference_task(void* /*arg*/)
         memcpy(input_ptr, features, kNumMelChannels * sizeof(int8_t));
 
         // ── 4. Run inference ───────────────────────────────────
+        //   Feed WDT immediately before the long Invoke() so the
+        //   full TWDT timeout window (30 s) is available.
+        esp_task_wdt_reset();
+
         if (!s_model->Invoke()) {
             ESP_LOGE(TAG, "Inference failed!");
+            vTaskDelay(1);
             continue;
         }
+
+        // Feed WDT immediately after Invoke() completes
+        esp_task_wdt_reset();
 
         // ── 5. Read output probability [0–255] ────────────────
         uint8_t probability = s_model->GetOutputProbability();
@@ -204,6 +225,12 @@ static void inference_task(void* /*arg*/)
 
         // ── 7. LED timeout management ─────────────────────────
         led_tick();
+
+        // ── 8. Yield to let lower-priority tasks run ──────────
+        //   vTaskDelay(1) guarantees a context switch regardless
+        //   of priority, unlike taskYIELD() which only yields to
+        //   equal-or-higher priority tasks (never to IDLE at 0).
+        vTaskDelay(1);
     }
 }
 
