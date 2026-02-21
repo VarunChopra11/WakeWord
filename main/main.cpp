@@ -120,8 +120,8 @@ static void i2s_init()
     // Standard mode (Philips / I2S)
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                     I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
+                                                     I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = static_cast<gpio_num_t>(kI2S_SCK),
@@ -139,7 +139,7 @@ static void i2s_init()
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_rx_handle));
 
-    ESP_LOGI(TAG, "I2S initialised: %d Hz, mono, 16-bit", kSampleRate);
+    ESP_LOGI(TAG, "I2S initialised: %d Hz, Philips, 32-bit, Stereo", kSampleRate);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -147,89 +147,105 @@ static void i2s_init()
 // ─────────────────────────────────────────────────────────────
 static void inference_task(void* /*arg*/)
 {
-    // ── Subscribe this task to the Task Watchdog Timer ────────
-    //
-    // IDLE1 monitoring is disabled via sdkconfig (the inference task
-    // permanently hogs Core 1 at priority 5, starving IDLE1).  Instead
-    // this task feeds the WDT itself before and after every Invoke().
     esp_task_wdt_add(NULL);
 
-    // PCM read buffer: 160 samples × 2 bytes = 320 bytes
-    static int16_t  pcm_buf[kStrideSamples];
+    // Buffers
+    static int32_t  raw_buf[kStrideSamples * 2]; // 32-bit Stereo
+    static int16_t  pcm_buf[kStrideSamples];     // 16-bit Mono
     static int8_t   features[kNumMelChannels];
 
-    ESP_LOGI(TAG, "Streaming task started (stride=%d samples)", kStrideSamples);
+    // Filter state
+    static float dc_offset = 0.0f;
+    const float  dc_alpha  = 0.95f; 
+
+    // ── TUNING PARAMETER ──────────────────────────────────────────
+    const int32_t kGainShift = 12; // Adjusted for optimal volume
+    // ──────────────────────────────────────────────────────────────
+
+    static int debug_timer = 0;
+
+    ESP_LOGI(TAG, "Streaming task started (Gain Tuned to >> 12)");
 
     while (true) {
-        // ── 1. Read 160 PCM samples from I2S ──────────────────
         size_t bytes_read = 0;
+        
+        // 1. Read Raw I2S
         esp_err_t err = i2s_channel_read(
-            s_i2s_rx_handle,
-            pcm_buf,
-            sizeof(pcm_buf),
-            &bytes_read,
-            portMAX_DELAY
+            s_i2s_rx_handle, raw_buf, sizeof(raw_buf), &bytes_read, portMAX_DELAY
         );
 
-        // Feed WDT after the potentially long blocking I2S read
         esp_task_wdt_reset();
 
         if (err != ESP_OK || bytes_read == 0) {
-            ESP_LOGW(TAG, "I2S read error: %s", esp_err_to_name(err));
             vTaskDelay(1);
             continue;
         }
 
-        int samples_read = static_cast<int>(bytes_read / sizeof(int16_t));
+        // 2. Process Audio
+        int frames_read = bytes_read / (sizeof(int32_t) * 2);
+        int32_t signal_max_ac = 0; 
 
-        // ── 2. Generate one [1,1,40] feature slice ────────────
+        for (int i = 0; i < frames_read; i++) {
+            // LEFT Channel: raw_buf[i * 2]
+            // If you get NO signal, try RIGHT: raw_buf[i * 2 + 1]
+            int32_t raw = raw_buf[i * 2]; 
+
+            // DC Removal
+            dc_offset = (dc_alpha * dc_offset) + ((1.0f - dc_alpha) * (float)raw);
+            float centered = (float)raw - dc_offset;
+
+            // Apply Gain
+            int32_t amplified = (int32_t)centered >> kGainShift;
+
+            // Clamp
+            if (amplified > 32767)  amplified = 32767;
+            if (amplified < -32768) amplified = -32768;
+
+            pcm_buf[i] = (int16_t)amplified;
+
+            if (abs(amplified) > signal_max_ac) signal_max_ac = abs(amplified);
+        }
+
+        // 3. Generate Features
         bool slice_ready = s_preprocessor->ProcessSamples(
-            pcm_buf, samples_read, features
+            pcm_buf, frames_read, features
         );
 
         if (!slice_ready) {
-            // Not enough audio buffered yet — yield and loop back
             vTaskDelay(1);
             continue;
         }
 
-        // ── 3. Copy features into model input tensor ──────────
+        // 4. Inference
         int8_t* input_ptr = s_model->GetInputBuffer();
         memcpy(input_ptr, features, kNumMelChannels * sizeof(int8_t));
 
-        // ── 4. Run inference ───────────────────────────────────
-        //   Feed WDT immediately before the long Invoke() so the
-        //   full TWDT timeout window (30 s) is available.
+        esp_task_wdt_reset();
+        s_model->Invoke();
         esp_task_wdt_reset();
 
-        if (!s_model->Invoke()) {
-            ESP_LOGE(TAG, "Inference failed!");
-            vTaskDelay(1);
-            continue;
+        uint8_t prob = s_model->GetOutputProbability();
+
+        // 5. Intelligent Debug Logs
+        debug_timer++;
+        if (debug_timer >= 50) { // Every ~500ms
+            debug_timer = 0;
+            
+            const char* status = "UNKNOWN";
+            if (signal_max_ac < 500)        status = "SILENCE (OK)";
+            else if (signal_max_ac < 10000) status = "WEAK SIGNAL (Speak Louder)";
+            else if (signal_max_ac < 28000) status = "GOOD LEVEL (Target)";
+            else                            status = "CLIPPING (Too Loud)";
+            
+            ESP_LOGI(TAG, "Vol: %5ld | Prob: %3u | %s", signal_max_ac, prob, status);
         }
 
-        // Feed WDT immediately after Invoke() completes
-        esp_task_wdt_reset();
-
-        // ── 5. Read output probability [0–255] ────────────────
-        uint8_t probability = s_model->GetOutputProbability();
-
-        ESP_LOGD(TAG, "Probability: %u", probability);
-
-        // ── 6. Wake word detection check ──────────────────────
-        if (probability > kDetectThresh) {
-            ESP_LOGI(TAG, ">>> WAKE WORD DETECTED  (prob=%u/255) <<<",
-                     probability);
+        if (prob > kDetectThresh) {
+            ESP_LOGI(TAG, ">>> ALEXA DETECTED (Prob: %d) <<<", prob);
             led_wake_on();
         }
 
-        // ── 7. LED timeout management ─────────────────────────
         led_tick();
-
-        // ── 8. Yield to let lower-priority tasks run ──────────
-        //   vTaskDelay(1) guarantees a context switch regardless
-        //   of priority, unlike taskYIELD() which only yields to
-        //   equal-or-higher priority tasks (never to IDLE at 0).
         vTaskDelay(1);
     }
 }
