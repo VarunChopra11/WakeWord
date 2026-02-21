@@ -41,8 +41,8 @@ static constexpr gpio_num_t kLED_B  = GPIO_NUM_21;
 //  Audio / model configuration
 // ─────────────────────────────────────────────────────────────
 static constexpr int kSampleRate        = 16000;
-static constexpr int kStrideMs          = 10;
-static constexpr int kStrideSamples     = (kSampleRate * kStrideMs) / 1000;  // 160
+static constexpr int kStrideMs          = 20;
+static constexpr int kStrideSamples     = (kSampleRate * kStrideMs) / 1000;  // 320
 static constexpr int kNumMelChannels    = 40;
 
 static constexpr uint8_t kDetectThresh  = 200;   // ~78.4 % confidence
@@ -212,7 +212,7 @@ static void inference_task(void* /*arg*/)
 
         // 5. Intelligent Debug Logs
         debug_timer++;
-        if (debug_timer >= 50) { // Every ~500ms
+        if (debug_timer >= 25) { // Every ~500ms (25 * 20ms stride)
             debug_timer = 0;
             
             const char* status = "UNKNOWN";
@@ -275,7 +275,7 @@ extern "C" void app_main()
     xTaskCreatePinnedToCore(
         inference_task,
         "inference",
-        8192,          // Stack in internal SRAM
+        16384,         // Stack — Frontend needs more space
         nullptr,
         5,             // Priority
         nullptr,
