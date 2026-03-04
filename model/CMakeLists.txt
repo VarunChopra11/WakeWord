@@ -1,9 +1,9 @@
 idf_component_register(
     SRCS
-        "src/model_runner.cpp"
-        "src/model_data.cc"
+        "model_runner.cpp"
+        "model_data.cc"
     INCLUDE_DIRS
-        "include"
+        "."
     REQUIRES
         esp-tflite-micro
         log

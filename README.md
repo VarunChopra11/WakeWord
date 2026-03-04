@@ -1,289 +1,180 @@
-# Wake Word Detection Firmware
-## ESP32-S3-N16R8 · ESP-IDF · MicroWakeWord
+# Wake Word Detection — ESP32-S3
 
----
+On-device wake word detection firmware for the **ESP32-S3-N16R8**, using TensorFlow Lite Micro to run a streaming MicroWakeWord model entirely on the edge. The system continuously listens via an INMP441 I2S MEMS microphone and triggers an RGB LED when the wake word (e.g. "Alexa") is detected.
+
+## Architecture
+
+```
+INMP441 Mic ──I2S──▸ AudioPreprocessor ──▸ MicroWakeWord Model ──▸ LED Trigger
+                     (TFLite Micro)         (TFLite Micro)
+                     480 PCM → 40 INT8      [1,1,40] → probability
+                     mel features            (UINT8, 0–255)
+```
+
+Every **20 ms** stride:
+
+1. Read 320 PCM samples (16-bit mono, 16 kHz) from the I2S peripheral
+2. Accumulate into a 480-sample window and generate **40 INT8 mel-frequency features** using the TFLite audio preprocessor model
+3. Feed features into the **stateful streaming MicroWakeWord** model (22 VAR_HANDLE state slots maintain temporal context across frames)
+4. If output probability > **~78% (200/255)**, light the green LED for 2 seconds
 
 ## Hardware
 
-| Component       | Details                                      |
-|-----------------|----------------------------------------------|
-| MCU             | ESP32-S3-N16R8 (Xtensa LX7 dual-core 240 MHz) |
-| Flash           | 16 MB (QIO 80 MHz)                           |
-| PSRAM           | 8 MB Octal SPI                               |
-| Microphones     | 2 × INMP441 (I2S digital, 16 kHz)           |
-| LED             | Common-cathode RGB (GPIO 47/48/21)           |
+| Component | Details |
+|---|---|
+| MCU | ESP32-S3-N16R8 (dual-core 240 MHz, 16 MB Flash, 8 MB Octal PSRAM) |
+| Microphone | INMP441 I2S MEMS (16 kHz, 32-bit stereo, left channel used) |
+| LED | Common-cathode RGB LED |
 
-### Pin Assignments
+### Pin Mapping
 
-| Signal      | GPIO |
-|-------------|------|
-| I2S SCK     | 41   |
-| I2S WS      | 42   |
-| I2S SD (Mic 1, Left — L/R → GND) | 2 |
-| LED Red     | 48   |
-| LED Green   | 47   |
-| LED Blue    | 21   |
-
-> **Microphone orientation**
-> Mic 1 (Left channel): L/R pin → GND  
-> Mic 2 (Right channel): L/R pin → 3.3 V  
-> Only the left channel is read; both clocks are shared.
-
----
+| Signal | GPIO |
+|---|---|
+| I2S SCK (BCLK) | 41 |
+| I2S WS (LRCLK) | 42 |
+| I2S SD (Data In) | 2 |
+| LED Red | 48 |
+| LED Green | 47 |
+| LED Blue | 21 |
 
 ## Project Structure
 
 ```
-wake_word_detection/
-├── CMakeLists.txt                  — Top-level build entry
-├── partitions.csv                  — 5 MB factory app + 11 MB storage
-├── sdkconfig.defaults              — Octal PSRAM, 240 MHz, O3, 16 MB flash
+WakeWord/
+├── CMakeLists.txt              # Root project CMake — registers component dirs
+├── partitions.csv              # Custom partition table (5 MB app, ~11 MB storage)
+├── sdkconfig.defaults          # ESP-IDF Kconfig defaults
+├── alexa.tflite                # Source wake word model (TFLite flatbuffer)
 │
 ├── main/
 │   ├── CMakeLists.txt
-│   ├── idf_component.yml           — Declares esp-tflite-micro dependency
-│   └── main.cpp                    — I2S init, streaming loop, LED logic
+│   ├── idf_component.yml       # Declares esp-tflite-micro dependency
+│   └── main.cpp                # Entry point — I2S init, streaming inference task
 │
-└── components/
-    ├── audio_preprocessor/
-    │   ├── CMakeLists.txt
-    │   ├── include/
-    │   │   └── audio_preprocessor.h
-    │   └── src/
-    │       ├── audio_preprocessor.cpp   — Pipeline orchestration
-    │       ├── fft_util.{h,cpp}         — esp-dsp FFT wrapper
-    │       └── mel_filterbank.{h,cpp}   — 40-band triangular mel filterbank
-    │
-    └── model/
-        ├── CMakeLists.txt
-        ├── include/
-        │   ├── model_runner.h           — Interpreter lifecycle API
-        │   └── model_data.h             — Model array declaration
-        └── src/
-            ├── model_runner.cpp         — MicroInterpreter + ResourceVariables
-            └── model_data.cc            — TFLite flatbuffer (replace placeholder)
+├── audio_preprocessor/         # ESP-IDF component
+│   ├── CMakeLists.txt
+│   ├── audio_preprocessor.h    # Feature extraction constants & class
+│   ├── audio_preprocessor.cpp  # Ring buffer + TFLite preprocessor model runner
+│   └── audio_preprocessor_int8_model_data.h  # Embedded preprocessor .tflite
+│
+├── model/                      # ESP-IDF component
+│   ├── CMakeLists.txt
+│   ├── model_data.h            # Declares g_model_data[] / g_model_data_len
+│   ├── model_data.cc           # Auto-generated C array of the .tflite model
+│   ├── model_runner.h          # Stateful interpreter wrapper
+│   └── model_runner.cpp        # Arena, allocator, resource variables, inference
+│
+├── tools/
+│   └── convert_model.sh        # Converts .tflite → model_data.cc via xxd
+│
+└── managed_components/         # Auto-fetched by IDF Component Manager
+    ├── espressif__esp-nn/
+    └── espressif__esp-tflite-micro/
 ```
-
----
 
 ## Prerequisites
 
-### 1. Install ESP-IDF v5.1 or later
+- **ESP-IDF v5.1+** ([installation guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/))
+- Python 3.8+ (for ESP-IDF tools)
+- `xxd` (for model conversion; usually pre-installed on Linux/macOS)
+
+## Getting Started
+
+### 1. Set up ESP-IDF environment
 
 ```bash
-git clone --recursive https://github.com/espressif/esp-idf.git ~/esp/esp-idf
-cd ~/esp/esp-idf
-git checkout v5.2.1     # Tested version
-./install.sh esp32s3
-source export.sh
+. $IDF_PATH/export.sh
 ```
 
-### 2. Install ESP-IDF Component Manager dependencies
-
-The `main/idf_component.yml` declares:
-- `espressif/esp-tflite-micro >= 1.3.1`
-- `espressif/esp-dsp >= 1.0.0`
-
-These are downloaded automatically on first build.
-
----
-
-## Adding Your Model
-
-1. Place your `.tflite` file in the project root:
-   ```bash
-   cp ~/models/your_wakeword.tflite ./wakeword.tflite
-   ```
-
-2. Run the provided helper script:
-   ```bash
-   chmod +x tools/convert_model.sh
-   ./tools/convert_model.sh wakeword.tflite
-   ```
-   This generates `components/model/src/model_data.cc` with the correct
-   array name, alignment attribute, and length constant.
-
-3. **Or** do it manually:
-   ```bash
-   xxd -i wakeword.tflite | sed \
-     's/unsigned char .*/const uint8_t g_model_data[] __attribute__((aligned(8))) = {/' | \
-     sed 's/unsigned int .*/const size_t g_model_data_len = sizeof(g_model_data);/' \
-     > components/model/src/model_data.cc
-
-   # Prepend the required header include
-   sed -i '1s/^/#include "model_data.h"\n\n/' components/model/src/model_data.cc
-   ```
-
-### Verifying Model Compatibility
-
-Your `.tflite` must match these specifications (from model analysis):
-
-| Property       | Expected Value                        |
-|----------------|---------------------------------------|
-| Total size     | ~115,400 bytes                        |
-| Signature      | `serving_default`                     |
-| Input name     | `input_audio`                         |
-| Input shape    | `[1, 1, 40]`                          |
-| Input dtype    | `INT8`                                |
-| Output name    | `dense_1`                             |
-| Output shape   | `[1, 1]`                              |
-| Output dtype   | `UINT8`                               |
-| Subgraphs      | 2 (main inference + state init)       |
-| VAR_HANDLE ops | 11 state buffers (stream_11–stream_21)|
-| Resource vars  | 22 slots allocated                    |
-
----
-
-## Building
+### 2. Build
 
 ```bash
-cd wake_word_detection
-
-# Set target
 idf.py set-target esp32s3
-
-# Build (component manager downloads dependencies automatically)
 idf.py build
 ```
 
-### First build output
-
-Expected flash usage:
-```
-Project Memory Type Usage Summary:
-  DRAM .data size:     ~12 KB
-  DRAM .bss  size:     ~6  KB
-  Flash code size:     ~1.2 MB   (TFLite Micro runtime)
-  Flash rodata size:   ~115 KB   (model weights)
-  Total binary size:   ~1.4 MB   (well within 5 MB factory partition)
-```
-
----
-
-## Flashing
+### 3. Flash & Monitor
 
 ```bash
-# Replace /dev/ttyUSB0 with your actual port
-idf.py -p /dev/ttyUSB0 flash monitor
+idf.py flash monitor
 ```
 
-On macOS use `/dev/cu.usbserial-*`.
+Press `Ctrl+]` to exit the serial monitor.
 
----
+## Replacing the Wake Word Model
 
-## Runtime Behaviour
+To use a different MicroWakeWord `.tflite` model:
 
-### Boot sequence (logged over UART at 115200 baud)
-
-```
-I (xxx) WWD: === Wake Word Detection Booting ===
-I (xxx) WWD: Chip: ESP32-S3-N16R8 | Flash: 16MB | PSRAM: 8MB Octal
-I (xxx) AudioPreprocessor: Initialising audio preprocessor
-I (xxx) AudioPreprocessor:   Window: 30 ms (480 samples)
-I (xxx) AudioPreprocessor:   Stride: 10 ms (160 samples)
-I (xxx) AudioPreprocessor:   FFT:    512 points → 257 bins
-I (xxx) AudioPreprocessor:   Mels:   40 channels
-I (xxx) mel_fb: Mel filterbank initialised: 40 bands, 20–7600 Hz
-I (xxx) ModelRunner: Initialising ModelRunner
-I (xxx) ModelRunner:   Arena:              150 KB in PSRAM
-I (xxx) ModelRunner:   Resource variables: 22
-I (xxx) ModelRunner:   MicroResourceVariables created (22 slots)
-I (xxx) ModelRunner:   Input  tensor: shape=[1,1,40] dtype=9
-I (xxx) ModelRunner:   Output tensor: shape=[1,1] dtype=3
-I (xxx) ModelRunner: ModelRunner ready — streaming state active
-I (xxx) WWD: I2S initialised: 16000 Hz, mono, 16-bit
-I (xxx) WWD: All systems ready. Starting inference task...
-I (xxx) WWD: Streaming task started (stride=160 samples)
-```
-
-### Wake word detection
-
-When a wake word is detected (output probability > 200/255 ≈ 78%):
-
-```
-I (xxx) WWD: >>> WAKE WORD DETECTED  (prob=217/255) <<<
-```
-
-The **green LED** (GPIO 47) turns on for **2 seconds**.
-
----
-
-## Tuning
-
-### Detection threshold
-
-In `main/main.cpp`:
-```cpp
-static constexpr uint8_t kDetectThresh = 200;  // 200/255 ≈ 78.4%
-```
-Increase to reduce false positives; decrease for higher sensitivity.
-
-### Feature quantisation
-
-In `components/audio_preprocessor/include/audio_preprocessor.h`:
-```cpp
-static constexpr float kFeatureScale = 1.0f / 52.0f;
-static constexpr int   kFeatureZp    = -30;
-```
-These must match the `input_quantization` parameters baked into your `.tflite`
-model.  Retrieve them with:
 ```bash
-python3 - <<'EOF'
-import flatbuffers, tflite.Model as M
-data = open("wakeword.tflite","rb").read()
-model = M.Model.GetRootAsModel(bytearray(data), 0)
-sg = model.Subgraphs(0)
-t  = sg.Tensors(0)
-print("scale    =", t.Quantization().Scale(0))
-print("zero_pt  =", t.Quantization().ZeroPoint(0))
-EOF
+./tools/convert_model.sh path/to/your_model.tflite
 ```
 
-### Resource variable count
+This generates `model/model_data.cc` with the model embedded as a C array. Then rebuild:
 
-If your model has more or fewer VAR_HANDLE ops, update:
+```bash
+idf.py build
+```
+
+> **Note:** The new model must have a compatible input shape `[1, 1, 40]` (INT8) and output shape `[1, 1]` (UINT8). You may also need to adjust the op resolver in `model_runner.cpp` if the new model uses different TFLite ops.
+
+## Key Configuration
+
+### Detection Threshold
+
+In `main.cpp`:
+
 ```cpp
-// components/model/include/model_runner.h
-static constexpr int kNumResourceVariables = 22;
+static constexpr uint8_t kDetectThresh = 200;  // ~78% confidence
 ```
 
-### Tensor arena size
+Lower values increase sensitivity (more detections, more false positives). Higher values require stronger confidence.
 
-If `AllocateTensors()` fails with OOM, increase:
-```cpp
-static constexpr size_t kTensorArenaSize = 150 * 1024;  // in model_runner.h
+### Audio Parameters
+
+Defined in `audio_preprocessor.h`:
+
+| Parameter | Value | Description |
+|---|---|---|
+| Sample rate | 16,000 Hz | I2S capture rate |
+| Window size | 30 ms (480 samples) | FFT window for feature extraction |
+| Stride | 20 ms (320 samples) | Step between successive feature slices |
+| Mel channels | 40 | INT8 features per slice |
+
+### Memory Layout
+
+| Resource | Size | Location |
+|---|---|---|
+| Preprocessor arena | 16 KB | PSRAM |
+| Model tensor arena | 150 KB | PSRAM (16-byte aligned) |
+| Inference task stack | 16 KB | Internal SRAM |
+| Model resource variables | 22 slots | Inside tensor arena |
+
+### Partition Table
+
+| Name | Type | Size |
+|---|---|---|
+| nvs | data | 24 KB |
+| phy_init | data | 4 KB |
+| factory | app | 5 MB |
+| storage | data (SPIFFS) | ~11 MB |
+
+## Serial Monitor Output
+
+Diagnostic logs are printed every ~500 ms:
+
 ```
-Maximum safe value with 8 MB PSRAM is approximately 6 MB (leaving room for
-heap, stack, and driver buffers).
+I (12345) WWD: Vol:  8234 | Prob:  42 | feat[0..3]: -12,5,-3,8 | GOOD LEVEL (Target)
+I (12845) WWD: Vol: 15200 | Prob: 215 | feat[0..3]: 20,18,12,9 | GOOD LEVEL (Target)
+I (12845) WWD: >>> ALEXA DETECTED (Prob: 215) <<<
+```
 
----
-
-## Memory Map
-
-| Region        | Location | Size    | Contents                         |
-|---------------|----------|---------|----------------------------------|
-| Tensor arena  | PSRAM    | 150 KB  | TFLite tensors + state buffers   |
-| Ring buffer   | PSRAM    | ~1 KB   | PCM audio (480 × int16)          |
-| FFT buffers   | PSRAM    | ~5 KB   | Windowed + complex FFT data      |
-| Mel table     | PSRAM    | ~10 KB  | Filterbank lookup entries        |
-| Model weights | Flash    | ~115 KB | Quantised kernel data (read-only)|
-| Stack         | IRAM     | 8 KB    | inference_task stack             |
-
----
-
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| Crash at `Invoke()` | Missing VAR_HANDLE op registration | Ensure `AddVarHandle()`, `AddReadVariable()`, `AddAssignVariable()` are called |
-| `AllocateTensors()` returns error | Arena too small | Increase `kTensorArenaSize` |
-| No audio / all-zero features | I2S wiring | Check SCK/WS/SD pins; verify INMP441 L/R strapping |
-| Always detecting wake word | Threshold too low | Increase `kDetectThresh` toward 230–240 |
-| Never detecting wake word | Feature mismatch | Verify `kFeatureScale` / `kFeatureZp` against model quantisation params |
-| PSRAM not detected | sdkconfig mismatch | Verify `CONFIG_SPIRAM_MODE_OCT=y` and correct flash mode |
-
----
+| Field | Meaning |
+|---|---|
+| Vol | Peak absolute PCM amplitude (0–32767) |
+| Prob | Wake word probability (0–255; threshold = 200) |
+| feat[0..3] | First 4 mel features (sanity check) |
+| Status | SILENCE / WEAK SIGNAL / GOOD LEVEL / CLIPPING |
 
 ## License
 
-Proprietary — All rights reserved.
+This project is part of the Hellum firmware suite.

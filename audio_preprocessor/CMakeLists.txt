@@ -1,8 +1,8 @@
 idf_component_register(
     SRCS
-        "src/audio_preprocessor.cpp"
+        "audio_preprocessor.cpp"
     INCLUDE_DIRS
-        "include"
+        "."
     REQUIRES
         log
         espressif__esp-tflite-micro
