@@ -4,8 +4,8 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
     REQUIRES
-        micro_speech_features
         log
+        espressif__esp-tflite-micro
 )
 
 # Enable aggressive optimisation

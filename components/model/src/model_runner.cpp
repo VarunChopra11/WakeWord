@@ -218,20 +218,6 @@ uint8_t ModelRunner::GetOutputProbability()
     return output->data.uint8[0];
 }
 
-float ModelRunner::GetInputScale()
-{
-    TfLiteTensor* input = interpreter_->input(0);
-    if (!input) return 1.0f;
-    return input->params.scale;
-}
-
-int ModelRunner::GetInputZeroPoint()
-{
-    TfLiteTensor* input = interpreter_->input(0);
-    if (!input) return 0;
-    return input->params.zero_point;
-}
-
 // ─────────────────────────────────────────────────────────────
 //  Op Registration
 // ─────────────────────────────────────────────────────────────

@@ -12,7 +12,6 @@
  *   4. If output > 200 (~80%), toggle wake-word LED for 2 s
  */
 
-#include <cstdio>
 #include <cstring>
 
 #include "freertos/FreeRTOS.h"
@@ -39,12 +38,9 @@ static constexpr gpio_num_t kLED_B  = GPIO_NUM_21;
 
 // ─────────────────────────────────────────────────────────────
 //  Audio / model configuration
+//  (kAudioSampleRate, kStrideSamples, kPreprocessorFeatureSize
+//   are defined in audio_preprocessor.h)
 // ─────────────────────────────────────────────────────────────
-static constexpr int kSampleRate        = 16000;
-static constexpr int kStrideMs          = 20;
-static constexpr int kStrideSamples     = (kSampleRate * kStrideMs) / 1000;  // 320
-static constexpr int kNumMelChannels    = 40;
-
 static constexpr uint8_t kDetectThresh  = 200;   // ~78.4 % confidence
 static constexpr int64_t kLedOnUs       = 2000000LL; // 2 seconds in µs
 
@@ -119,7 +115,7 @@ static void i2s_init()
 
     // Standard mode (Philips / I2S)
     i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate),
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(kAudioSampleRate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
                                                      I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
@@ -139,7 +135,7 @@ static void i2s_init()
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_rx_handle));
 
-    ESP_LOGI(TAG, "I2S initialised: %d Hz, Philips, 32-bit, Stereo", kSampleRate);
+    ESP_LOGI(TAG, "I2S initialised: %d Hz, Philips, 32-bit, Stereo", kAudioSampleRate);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -152,7 +148,7 @@ static void inference_task(void* /*arg*/)
     // Buffers
     static int32_t  raw_buf[kStrideSamples * 2]; // 32-bit Stereo
     static int16_t  pcm_buf[kStrideSamples];     // 16-bit Mono
-    static int8_t   features[kNumMelChannels];
+    static int8_t   features[kPreprocessorFeatureSize];
 
     static int debug_timer = 0;
 
@@ -202,7 +198,7 @@ static void inference_task(void* /*arg*/)
 
         // 4. Inference
         int8_t* input_ptr = s_model->GetInputBuffer();
-        memcpy(input_ptr, features, kNumMelChannels * sizeof(int8_t));
+        memcpy(input_ptr, features, kPreprocessorFeatureSize * sizeof(int8_t));
 
         esp_task_wdt_reset();
         s_model->Invoke();
@@ -260,11 +256,6 @@ extern "C" void app_main()
         ESP_LOGE(TAG, "ModelRunner init failed — halting");
         esp_restart();
     }
-
-    // ── Pass quantisation params from model → preprocessor ──
-    float in_scale = s_model->GetInputScale();
-    int   in_zp    = s_model->GetInputZeroPoint();
-    s_preprocessor->SetQuantizationParams(in_scale, in_zp);
 
     // ── I2S ──────────────────────────────────────────────────
     i2s_init();
