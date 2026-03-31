@@ -58,8 +58,8 @@ static const char* TAG = "NetTask";
     static constexpr bool kUseOpus = false;
 #endif
 
-// Opus output buffer (max Opus frame is ~1275 bytes, but typical is ~60-80)
-static constexpr size_t kOpusMaxBytes = 512;
+// Opus output buffer (max Opus frame is ~1275 bytes, raw PCM is 640 bytes)
+static constexpr size_t kOpusMaxBytes = 1024;
 static uint8_t s_opus_out[kOpusMaxBytes];
 
 // ═════════════════════════════════════════════════════════════════
@@ -310,6 +310,26 @@ static void stream_audio_to_server(HellumContext* ctx)
     int16_t frame_buf[kOpusFrameSamples];
     size_t preroll_sent = 0;
 
+    // ── WebSocket Send Buffer (Batching) ─────────────────────
+    // Allocating on heap to save stack space
+    const size_t kBatchSize = 4096;
+    uint8_t* tx_buf = static_cast<uint8_t*>(malloc(kBatchSize));
+    size_t tx_len = 0;
+
+    if (!tx_buf) {
+        ESP_LOGE(TAG, "Failed to allocate TX buffer!");
+        return; 
+    }
+
+    auto flush_tx = [&]() {
+        if (tx_len > 0 && esp_websocket_client_is_connected(s_ws_client)) {
+            esp_websocket_client_send_bin(s_ws_client, 
+                                          reinterpret_cast<const char*>(tx_buf), 
+                                          tx_len, portMAX_DELAY);
+        }
+        tx_len = 0;
+    };
+
     while (preroll_sent < preroll_samples) {
         size_t remaining = preroll_samples - preroll_sent;
         size_t to_read = (remaining > kOpusFrameSamples) ?
@@ -328,16 +348,21 @@ static void stream_audio_to_server(HellumContext* ctx)
         }
 
         int encoded_bytes = encode_frame(frame_buf, kOpusFrameSamples);
-        if (encoded_bytes > 0 && esp_websocket_client_is_connected(s_ws_client)) {
-            esp_websocket_client_send_bin(s_ws_client,
-                                           reinterpret_cast<const char*>(s_opus_out),
-                                           encoded_bytes,
-                                           portMAX_DELAY);
+        if (encoded_bytes > 0) {
+            // Flush if batch buffer is full
+            if (tx_len + encoded_bytes > kBatchSize) {
+                flush_tx();
+            }
+            memcpy(tx_buf + tx_len, s_opus_out, encoded_bytes);
+            tx_len += encoded_bytes;
         }
 
         read_idx     += got;
         preroll_sent += got;
     }
+
+    // Flush any remaining pre-roll
+    flush_tx();
 
     ESP_LOGI(TAG, "Pre-roll complete. Starting live stream...");
     ctx->state.store(HellumState::STREAMING);
@@ -356,21 +381,27 @@ static void stream_audio_to_server(HellumContext* ctx)
         // Read next frame from ring buffer
         size_t got = rb->ReadFrom(read_idx, frame_buf, kOpusFrameSamples);
         if (got < kOpusFrameSamples) {
-            // Not enough new data yet — wait a bit
+            // Not enough new data yet — wait a bit and mostly flush tx
+            flush_tx();
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
         int encoded_bytes = encode_frame(frame_buf, kOpusFrameSamples);
-        if (encoded_bytes > 0 && esp_websocket_client_is_connected(s_ws_client)) {
-            esp_websocket_client_send_bin(s_ws_client,
-                                           reinterpret_cast<const char*>(s_opus_out),
-                                           encoded_bytes,
-                                           portMAX_DELAY);
+        if (encoded_bytes > 0) {
+            if (tx_len + encoded_bytes > kBatchSize) {
+                flush_tx();
+            }
+            memcpy(tx_buf + tx_len, s_opus_out, encoded_bytes);
+            tx_len += encoded_bytes;
         }
 
         read_idx += got;
     }
+
+    // Ensure final bytes are sent
+    flush_tx();
+    free(tx_buf);
 
     // ── Send stop event ──────────────────────────────────────
     ws_send_json("stop");

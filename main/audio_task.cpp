@@ -225,11 +225,13 @@ static void audio_task_entry(void* arg)
     int debug_counter     = 0;
     int64_t silence_start = 0;
     bool    silence_active = false;
+    int64_t cooldown_until_us = 0; // Cooldown timer after TTS
 
     ESP_LOGI(TAG, "Audio task started on Core %d", xPortGetCoreID());
 
     while (true) {
         const HellumState state = ctx->state.load();
+        const int64_t now_us = esp_timer_get_time();
 
         // ── 1. Read raw I2S stereo data ──────────────────────
         size_t bytes_read = 0;
@@ -278,6 +280,9 @@ static void audio_task_entry(void* arg)
 
             uint8_t prob = ctx->model->GetOutputProbability();
 
+            // Check if we are in the post-TTS cooldown period
+            bool in_cooldown = (now_us < cooldown_until_us);
+
             // Diagnostic logs every ~500ms (25 × 20ms)
             if (++debug_counter >= 25) {
                 debug_counter = 0;
@@ -285,14 +290,14 @@ static void audio_task_entry(void* arg)
                     (peak < 500)   ? "SILENCE" :
                     (peak < 10000) ? "WEAK"    :
                     (peak < 28000) ? "GOOD"    : "CLIPPING";
-                ESP_LOGI(TAG, "Vol:%5ld Prob:%3u feat:%d,%d,%d,%d [%s]",
+                ESP_LOGI(TAG, "Vol:%5ld Prob:%3u feat:%d,%d,%d,%d [%s]%s",
                          peak, prob,
                          features[0], features[1], features[2], features[3],
-                         level);
+                         level, in_cooldown ? " (COOLDOWN)" : "");
             }
 
             // ── Wake word detected! ──────────────────────────
-            if (prob > kDetectThreshold) {
+            if (prob > kDetectThreshold && !in_cooldown) {
                 ESP_LOGI(TAG, ">>> WAKE WORD DETECTED (prob=%u) <<<", prob);
 
                 ctx->state.store(HellumState::WAKE_DETECTED);
@@ -318,7 +323,6 @@ static void audio_task_entry(void* arg)
         // ─────────────────────────────────────────────────────
         case HellumState::STREAMING: {
             int32_t energy = compute_energy(mono_pcm, frames_read);
-            int64_t now_us = esp_timer_get_time();
 
             if (energy < kVadEnergyThreshold) {
                 // Silence detected
@@ -373,7 +377,7 @@ static void audio_task_entry(void* arg)
 
                 // Check if this was the last chunk
                 if (chunk.is_last) {
-                    // Small delay to let the DAC flush
+                    // Small delay to let the DAC flush (must happen inline for UX)
                     vTaskDelay(pdMS_TO_TICKS(100));
                     i2s_channel_disable(s_tx_handle);
                     tx_enabled = false;
@@ -391,13 +395,15 @@ static void audio_task_entry(void* arg)
         case HellumState::POST_RESPONSE: {
             ESP_LOGI(TAG, "Post-response cleanup → returning to IDLE");
 
-            // Short visual feedback (LED handles the pattern)
-            vTaskDelay(pdMS_TO_TICKS(500));
-
             // Clear any stale event bits
             xEventGroupClearBits(ctx->event_group, BIT_ALL);
 
-            // Return to listening mode
+            // Give the TFLite model 1.5 seconds to "cool down" and stabilize
+            // its internal state on ambient room noise after the jarring jump cut.
+            // Also prevents acoustic echo from immediately triggering it.
+            cooldown_until_us = now_us + 1500000;
+
+            // Return to listening mode immediately (no blocking vTaskDelay here!)
             ctx->state.store(HellumState::IDLE);
             debug_counter = 0;
             break;
