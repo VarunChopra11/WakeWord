@@ -1,5 +1,5 @@
 # ============================================================
-#  sdkconfig.defaults — ESP32-S3-N16R8 Wake Word Detection
+#  sdkconfig.defaults — Hellum Hub (ESP32-S3-N16R8)
 # ============================================================
 
 # --- Target ---
@@ -58,11 +58,6 @@ CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
 CONFIG_NEWLIB_STDOUT_LINE_ENDING_CRLF=n
 
 # --- Task Watchdog ---
-# MicroWakeWord inference (CONV_2D heavy) may exceed the default 5 s
-# timeout in a single Invoke() call.  The inference task is pinned to
-# Core 1 at priority 5, which starves IDLE1.  Disable IDLE1 TWDT
-# monitoring; the inference task subscribes itself and feeds the WDT
-# manually.  Timeout raised to 30 s as a safety net.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
@@ -70,3 +65,29 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 # --- Heap ---
 CONFIG_HEAP_POISONING_DISABLED=y
 CONFIG_HEAP_TRACING_STANDALONE=n
+
+# ============================================================
+#  Hellum Hub — Networking
+# ============================================================
+
+# --- Wi-Fi ---
+CONFIG_ESP_WIFI_SSID="47jio4g"
+CONFIG_ESP_WIFI_PASSWORD="varun1100"
+
+# --- lwIP ---
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
+CONFIG_LWIP_TCP_WND_DEFAULT=5744
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
+CONFIG_LWIP_SO_REUSE=y
+
+# --- WebSocket ---
+# esp_websocket_client uses its own internal config; no Kconfig needed.
+
+# --- Wi-Fi power settings ---
+CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP32_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM=32

@@ -1,275 +1,225 @@
 /**
  * @file main.cpp
- * @brief Wake Word Detection Firmware — ESP32-S3-N16R8
+ * @brief Hellum Hub — Application entry point.
  *
- * Streaming pipeline:
- *   I2S (INMP441) → AudioPreprocessor → MicroWakeWord → LED trigger
+ * Boot sequence:
+ *   1. NVS Flash init
+ *   2. Wi-Fi STA connect (blocking with retry)
+ *   3. Allocate shared HellumContext (FreeRTOS primitives, ring buffer)
+ *   4. Init AudioPreprocessor and ModelRunner (existing, untouched logic)
+ *   5. Init LED manager
+ *   6. Start Audio Task on Core 1 (I2S, wake word, VAD, playback)
+ *   7. Start Network Task on Core 0 (WebSocket, Opus, streaming)
+ *   8. Main task idles (health monitoring)
  *
- * Every 10 ms:
- *   1. Read 160 PCM samples from I2S
- *   2. Generate one [1,1,40] INT8 feature slice
- *   3. Run TFLite Micro inference
- *   4. If output > 200 (~80%), toggle wake-word LED for 2 s
+ * Hardware: ESP32-S3-N16R8 (dual-core 240MHz, 16MB Flash, 8MB PSRAM)
  */
 
 #include <cstring>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
-#include "driver/i2s_std.h"
+
+#include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_timer.h"
-#include "esp_task_wdt.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
 
 #include "audio_preprocessor.h"
+#include "audio_task.h"
+#include "hellum_types.h"
+#include "led_manager.h"
 #include "model_runner.h"
+#include "network_task.h"
+#include "ring_buffer.h"
 
-// ─────────────────────────────────────────────────────────────
-//  Hardware configuration
-// ─────────────────────────────────────────────────────────────
-static constexpr int    kI2S_SCK   = 41;
-static constexpr int    kI2S_WS    = 42;
-static constexpr int    kI2S_SD    = 2;
+static const char *TAG = "HellumHub";
 
-static constexpr gpio_num_t kLED_R  = GPIO_NUM_48;
-static constexpr gpio_num_t kLED_G  = GPIO_NUM_47;
-static constexpr gpio_num_t kLED_B  = GPIO_NUM_21;
+// ═════════════════════════════════════════════════════════════════
+//  Wi-Fi Configuration (override via menuconfig / Kconfig)
+// ═════════════════════════════════════════════════════════════════
+#ifndef CONFIG_HELLUM_WIFI_SSID
+#define CONFIG_HELLUM_WIFI_SSID "47jio4g"
+#endif
 
-// ─────────────────────────────────────────────────────────────
-//  Audio / model configuration
-//  (kAudioSampleRate, kStrideSamples, kPreprocessorFeatureSize
-//   are defined in audio_preprocessor.h)
-// ─────────────────────────────────────────────────────────────
-static constexpr uint8_t kDetectThresh  = 200;   // ~78.4 % confidence
-static constexpr int64_t kLedOnUs       = 2000000LL; // 2 seconds in µs
+#ifndef CONFIG_HELLUM_WIFI_PASS
+#define CONFIG_HELLUM_WIFI_PASS "varun1100"
+#endif
 
-static const char* TAG = "WWD";
+#ifndef CONFIG_HELLUM_WS_URI
+#define CONFIG_HELLUM_WS_URI "wss://sampleserver-cp2h.onrender.com/ws"
+#endif
 
-// ─────────────────────────────────────────────────────────────
-//  Globals
-// ─────────────────────────────────────────────────────────────
-static i2s_chan_handle_t  s_i2s_rx_handle = nullptr;
-static AudioPreprocessor* s_preprocessor  = nullptr;
-static ModelRunner*       s_model         = nullptr;
+// ═════════════════════════════════════════════════════════════════
+//  Shared Context — single global instance, lives for app lifetime
+// ═════════════════════════════════════════════════════════════════
+static HellumContext s_ctx;
 
-static int64_t  s_led_off_time_us = 0;
-static bool     s_led_active      = false;
+// ═════════════════════════════════════════════════════════════════
+//  Wi-Fi Event Handler
+// ═════════════════════════════════════════════════════════════════
+static int s_wifi_retry_count = 0;
+static constexpr int kMaxWifiRetries = 10;
 
-// ─────────────────────────────────────────────────────────────
-//  LED helpers
-// ─────────────────────────────────────────────────────────────
-static void led_init()
-{
-    gpio_config_t cfg = {};
-    cfg.pin_bit_mask = (1ULL << kLED_R) | (1ULL << kLED_G) | (1ULL << kLED_B);
-    cfg.mode         = GPIO_MODE_OUTPUT;
-    cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
-    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    cfg.intr_type    = GPIO_INTR_DISABLE;
-    gpio_config(&cfg);
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data) {
+  if (event_base == WIFI_EVENT) {
+    switch (event_id) {
+    case WIFI_EVENT_STA_START:
+      esp_wifi_connect();
+      break;
 
-    // All off (common-cathode → LOW = off)
-    gpio_set_level(kLED_R, 0);
-    gpio_set_level(kLED_G, 0);
-    gpio_set_level(kLED_B, 0);
-}
+    case WIFI_EVENT_STA_DISCONNECTED:
+      if (s_wifi_retry_count < kMaxWifiRetries) {
+        ++s_wifi_retry_count;
+        ESP_LOGW(TAG, "Wi-Fi disconnected — retry %d/%d", s_wifi_retry_count,
+                 kMaxWifiRetries);
+        esp_wifi_connect();
+      } else {
+        ESP_LOGE(TAG, "Wi-Fi max retries exceeded");
+        xEventGroupClearBits(s_ctx.event_group, BIT_WIFI_CONNECTED);
+      }
+      break;
 
-static inline void led_wake_on()
-{
-    gpio_set_level(kLED_G, 1);   // Green = wake word detected
-    gpio_set_level(kLED_R, 0);
-    gpio_set_level(kLED_B, 0);
-    s_led_off_time_us = esp_timer_get_time() + kLedOnUs;
-    s_led_active      = true;
-}
-
-static inline void led_off()
-{
-    gpio_set_level(kLED_R, 0);
-    gpio_set_level(kLED_G, 0);
-    gpio_set_level(kLED_B, 0);
-    s_led_active = false;
-}
-
-static void led_tick()
-{
-    if (s_led_active && esp_timer_get_time() >= s_led_off_time_us) {
-        led_off();
+    default:
+      break;
     }
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    auto *event = static_cast<ip_event_got_ip_t *>(event_data);
+    ESP_LOGI(TAG, "Wi-Fi connected — IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    s_wifi_retry_count = 0;
+    xEventGroupSetBits(s_ctx.event_group, BIT_WIFI_CONNECTED);
+  }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  I2S initialisation — INMP441 @ 16 kHz mono
-// ─────────────────────────────────────────────────────────────
-static void i2s_init()
-{
-    // Channel configuration
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(
-        I2S_NUM_0,
-        I2S_ROLE_MASTER
-    );
-    chan_cfg.auto_clear = true;
+// ═════════════════════════════════════════════════════════════════
+//  Wi-Fi STA Init
+// ═════════════════════════════════════════════════════════════════
+static void wifi_init_sta() {
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_sta();
 
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, nullptr, &s_i2s_rx_handle));
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Standard mode (Philips / I2S)
-    i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(kAudioSampleRate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
-                                                     I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = static_cast<gpio_num_t>(kI2S_SCK),
-            .ws   = static_cast<gpio_num_t>(kI2S_WS),
-            .dout = I2S_GPIO_UNUSED,
-            .din  = static_cast<gpio_num_t>(kI2S_SD),
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
-            },
-        },
-    };
+  // Register event handlers
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr, nullptr));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr, nullptr));
 
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx_handle, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_rx_handle));
+  // Configure STA
+  wifi_config_t wifi_cfg = {};
+  strncpy(reinterpret_cast<char *>(wifi_cfg.sta.ssid), CONFIG_HELLUM_WIFI_SSID,
+          sizeof(wifi_cfg.sta.ssid) - 1);
+  strncpy(reinterpret_cast<char *>(wifi_cfg.sta.password),
+          CONFIG_HELLUM_WIFI_PASS, sizeof(wifi_cfg.sta.password) - 1);
+  wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    ESP_LOGI(TAG, "I2S initialised: %d Hz, Philips, 32-bit, Stereo", kAudioSampleRate);
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+  ESP_ERROR_CHECK(esp_wifi_start());
+
+  ESP_LOGI(TAG, "Wi-Fi STA initialised — connecting to \"%s\"...",
+           CONFIG_HELLUM_WIFI_SSID);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Main streaming task
-// ─────────────────────────────────────────────────────────────
-static void inference_task(void* /*arg*/)
-{
-    esp_task_wdt_add(NULL);
+// ═════════════════════════════════════════════════════════════════
+//  Application Entry Point
+// ═════════════════════════════════════════════════════════════════
+extern "C" void app_main() {
+  ESP_LOGI(TAG, "╔══════════════════════════════════════════╗");
+  ESP_LOGI(TAG, "║        Hellum Hub — Booting...           ║");
+  ESP_LOGI(TAG, "║  ESP32-S3-N16R8 | 16MB Flash | 8MB PSRAM║");
+  ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
 
-    // Buffers
-    static int32_t  raw_buf[kStrideSamples * 2]; // 32-bit Stereo
-    static int16_t  pcm_buf[kStrideSamples];     // 16-bit Mono
-    static int8_t   features[kPreprocessorFeatureSize];
+  // ── 1. NVS Flash ─────────────────────────────────────────
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
+  ESP_LOGI(TAG, "[1/7] NVS Flash initialised");
 
-    static int debug_timer = 0;
+  // ── 2. FreeRTOS Primitives ───────────────────────────────
+  s_ctx.event_group = xEventGroupCreate();
+  s_ctx.tts_queue = xQueueCreate(kTtsQueueDepth, sizeof(TtsChunk));
+  if (!s_ctx.event_group || !s_ctx.tts_queue) {
+    ESP_LOGE(TAG, "Failed to create FreeRTOS primitives — halting");
+    esp_restart();
+  }
+  ESP_LOGI(TAG, "[2/7] FreeRTOS primitives created");
 
-    ESP_LOGI(TAG, "Streaming task started");
+  // ── 3. Ring Buffer (PSRAM) ───────────────────────────────
+  s_ctx.ring_buffer = new RingBuffer(kRingBufferSamples);
+  if (!s_ctx.ring_buffer->Init()) {
+    ESP_LOGE(TAG, "Ring buffer init failed — halting");
+    esp_restart();
+  }
+  ESP_LOGI(TAG, "[3/7] Ring buffer: %d samples (%ds) in PSRAM",
+           kRingBufferSamples, kRingBufferDurationSec);
 
-    while (true) {
-        size_t bytes_read = 0;
-        
-        // 1. Read Raw I2S
-        esp_err_t err = i2s_channel_read(
-            s_i2s_rx_handle, raw_buf, sizeof(raw_buf), &bytes_read, portMAX_DELAY
-        );
+  // ── 4. Audio Preprocessor (existing, untouched) ──────────
+  s_ctx.preprocessor = new AudioPreprocessor();
+  if (!s_ctx.preprocessor->Init()) {
+    ESP_LOGE(TAG, "AudioPreprocessor init failed — halting");
+    esp_restart();
+  }
+  ESP_LOGI(TAG, "[4/7] AudioPreprocessor ready");
 
-        esp_task_wdt_reset();
+  // ── 5. Model Runner (existing, untouched) ────────────────
+  s_ctx.model = new ModelRunner();
+  if (!s_ctx.model->Init()) {
+    ESP_LOGE(TAG, "ModelRunner init failed — halting");
+    esp_restart();
+  }
+  ESP_LOGI(TAG, "[5/7] ModelRunner ready (streaming state active)");
 
-        if (err != ESP_OK || bytes_read == 0) {
-            vTaskDelay(1);
-            continue;
-        }
+  // ── 6. LED Manager ───────────────────────────────────────
+  led::Init();
+  ESP_LOGI(TAG, "[6/7] LED manager initialised");
 
-        // 2. Process Audio
-        int frames_read = bytes_read / (sizeof(int32_t) * 2);
-        int32_t signal_max_ac = 0; 
+  // ── 7. Wi-Fi ─────────────────────────────────────────────
+  s_ctx.wifi_ssid = CONFIG_HELLUM_WIFI_SSID;
+  s_ctx.wifi_pass = CONFIG_HELLUM_WIFI_PASS;
+  s_ctx.ws_uri = CONFIG_HELLUM_WS_URI;
+  wifi_init_sta();
+  ESP_LOGI(TAG, "[7/7] Wi-Fi STA started");
 
-        for (int i = 0; i < frames_read; i++) {
-            // INMP441: 24-bit data left-justified in 32-bit word.
-            // Left channel (INMP441 L/R pin = GND).
-            int32_t raw = raw_buf[i * 2];
+  // ═════════════════════════════════════════════════════════
+  //  Launch dual-core tasks
+  // ═════════════════════════════════════════════════════════
 
-            // Convert 32-bit I2S → 16-bit PCM (take upper 16 bits)
-            int16_t sample = static_cast<int16_t>(raw >> 16);
-            pcm_buf[i] = sample;
+  ESP_LOGI(TAG, "═══ Starting Dual-Core Pipeline ═══");
 
-            int32_t abs_val = sample < 0 ? -sample : sample;
-            if (abs_val > signal_max_ac) signal_max_ac = abs_val;
-        }
+  // Core 1: Audio capture, wake word, VAD, playback
+  audio_task_start(&s_ctx);
 
-        // 3. Generate Features
-        bool slice_ready = s_preprocessor->ProcessSamples(
-            pcm_buf, frames_read, features
-        );
+  // Core 0: Network, WebSocket, streaming
+  network_task_start(&s_ctx);
 
-        if (!slice_ready) {
-            led_tick();
-            continue;
-        }
+  ESP_LOGI(TAG, "╔══════════════════════════════════════════╗");
+  ESP_LOGI(TAG, "║      Hellum Hub — All Systems Ready      ║");
+  ESP_LOGI(TAG, "║  Audio: Core 1 | Network: Core 0         ║");
+  ESP_LOGI(TAG, "║  State: IDLE — Listening for wake word    ║");
+  ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
 
-        // 4. Inference
-        int8_t* input_ptr = s_model->GetInputBuffer();
-        memcpy(input_ptr, features, kPreprocessorFeatureSize * sizeof(int8_t));
+  // ── Main task: health monitor ────────────────────────────
+  // The main task now just monitors heap health and feeds WDT.
+  // In production, add OTA update checks, BLE provisioning, etc.
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(30000)); // Every 30 seconds
 
-        esp_task_wdt_reset();
-        s_model->Invoke();
-        esp_task_wdt_reset();
-
-        uint8_t prob = s_model->GetOutputProbability();
-
-        // 5. Intelligent Debug Logs
-        debug_timer++;
-        if (debug_timer >= 25) { // Every ~500ms (25 * 20ms stride)
-            debug_timer = 0;
-            
-            const char* status = "UNKNOWN";
-            if (signal_max_ac < 500)        status = "SILENCE (OK)";
-            else if (signal_max_ac < 10000) status = "WEAK SIGNAL (Speak Louder)";
-            else if (signal_max_ac < 28000) status = "GOOD LEVEL (Target)";
-            else                            status = "CLIPPING (Too Loud)";
-            
-            ESP_LOGI(TAG, "Vol: %5ld | Prob: %3u | feat[0..3]: %d,%d,%d,%d | %s",
-                     signal_max_ac, prob,
-                     features[0], features[1], features[2], features[3],
-                     status);
-        }
-
-        if (prob > kDetectThresh) {
-            ESP_LOGI(TAG, ">>> ALEXA DETECTED (Prob: %d) <<<", prob);
-            led_wake_on();
-        }
-
-        led_tick();
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Application entry point
-// ─────────────────────────────────────────────────────────────
-extern "C" void app_main()
-{
-    ESP_LOGI(TAG, "=== Wake Word Detection Booting ===");
-    ESP_LOGI(TAG, "Chip: ESP32-S3-N16R8 | Flash: 16MB | PSRAM: 8MB Octal");
-
-    // ── LEDs ──────────────────────────────────────────────────
-    led_init();
-
-    // ── Audio Preprocessor ───────────────────────────────────
-    s_preprocessor = new AudioPreprocessor();
-    if (!s_preprocessor->Init()) {
-        ESP_LOGE(TAG, "AudioPreprocessor init failed — halting");
-        esp_restart();
-    }
-
-    // ── Model ────────────────────────────────────────────────
-    s_model = new ModelRunner();
-    if (!s_model->Init()) {
-        ESP_LOGE(TAG, "ModelRunner init failed — halting");
-        esp_restart();
-    }
-
-    // ── I2S ──────────────────────────────────────────────────
-    i2s_init();
-
-    ESP_LOGI(TAG, "All systems ready. Starting inference task...");
-
-    // ── Streaming task (pinned to Core 1) ────────────────────
-    xTaskCreatePinnedToCore(
-        inference_task,
-        "inference",
-        16384,         // Stack — Frontend needs more space
-        nullptr,
-        5,             // Priority
-        nullptr,
-        1              // Core 1 (App CPU)
-    );
+    ESP_LOGI(TAG, "Health: Free heap=%u, Min free=%u, PSRAM free=%u",
+             esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  }
 }

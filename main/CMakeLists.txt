@@ -1,14 +1,25 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "audio_task.cpp"
+        "network_task.cpp"
+        "led_manager.cpp"
     INCLUDE_DIRS
         "."
     REQUIRES
         audio_preprocessor
         model
+        ring_buffer
         driver
         esp_timer
         esp_system
+        esp_wifi
+        esp_event
+        esp_netif
+        nvs_flash
+        esp_websocket_client
         freertos
         log
+        heap
+        json
 )
