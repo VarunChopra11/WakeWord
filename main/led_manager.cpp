@@ -27,9 +27,10 @@ static bool        s_blink_on       = false;
 
 static inline void SetRGB(int r, int g, int b)
 {
-    gpio_set_level(static_cast<gpio_num_t>(kPinLED_R), r);
-    gpio_set_level(static_cast<gpio_num_t>(kPinLED_G), g);
-    gpio_set_level(static_cast<gpio_num_t>(kPinLED_B), b);
+    // Common-anode: invert the logic (0 = ON, 1 = OFF)
+    gpio_set_level(static_cast<gpio_num_t>(kPinLED_R), r ? 0 : 1);
+    gpio_set_level(static_cast<gpio_num_t>(kPinLED_G), g ? 0 : 1);
+    gpio_set_level(static_cast<gpio_num_t>(kPinLED_B), b ? 0 : 1);
 }
 
 // ─────────────────────────────────────────────────────────────

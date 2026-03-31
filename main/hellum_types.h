@@ -33,7 +33,7 @@ static constexpr int kPinI2S_WS   = 42;   // LRCLK / Word Select — shared
 static constexpr int kPinI2S_DIN  = 2;    // Data In from mics (via mute switch)
 static constexpr int kPinI2S_DOUT = 1;    // Data Out to MAX98357A amplifier
 
-// RGB LED (common-cathode: HIGH = on)
+// RGB LED (common-anode: LOW = on, HIGH = off)
 static constexpr int kPinLED_R = 48;
 static constexpr int kPinLED_G = 47;
 static constexpr int kPinLED_B = 21;
