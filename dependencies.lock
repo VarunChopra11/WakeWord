@@ -23,13 +23,24 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.3.5
+  espressif/esp_websocket_client:
+    component_hash: c5a067a9fddea370c478017e66fac302f4b79c3d4027e9bdd42a019786cceb92
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.6.1
   idf:
     source:
       type: idf
     version: 5.5.2
 direct_dependencies:
 - espressif/esp-tflite-micro
+- espressif/esp_websocket_client
 - idf
-manifest_hash: 35e3c32bbec303a5a1c09ab394dde6dc4ab744ae8fae97cf770ab020a46da6c9
+manifest_hash: 4a382e99972f8b3907fd0558ab63655d9b89b2b22448436943efec5e1bdee74f
 target: esp32s3
 version: 2.0.0

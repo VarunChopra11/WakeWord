@@ -226,12 +226,19 @@ static void ws_event_handler(void* arg, esp_event_base_t event_base,
 // ═════════════════════════════════════════════════════════════════
 //  WebSocket Init
 // ═════════════════════════════════════════════════════════════════
+
+// Use the default CA bundle for mbedTLS (enabled via menuconfig)
+#include "esp_crt_bundle.h"
+
 static bool ws_init(HellumContext* ctx)
 {
     esp_websocket_client_config_t ws_cfg = {};
     ws_cfg.uri = ctx->ws_uri;
     ws_cfg.buffer_size = 2048;
     ws_cfg.task_stack  = 4096;
+    
+    // Enable SSL/TLS with the default certificate bundle
+    ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
 
     s_ws_client = esp_websocket_client_init(&ws_cfg);
     if (!s_ws_client) {
