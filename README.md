@@ -40,8 +40,8 @@ IDLE → WAKE_DETECTED → STREAMING → SERVER_PROCESSING → RESPONSE → POST
 |---|---|
 | MCU | ESP32-S3-N16R8 (dual-core 240 MHz, 16 MB Flash, 8 MB Octal PSRAM) |
 | Microphones | 2× INMP441 I2S MEMS (stereo: L/R channel separation for beamforming) |
-| Amplifier | MAX98357A I2S DAC (12dB gain, 5V supply) |
-| LED | Common-cathode RGB LED |
+| Amplifier | MAX98357A I2S DAC (12dB gain, 3.3V supply) |
+| LED | Common-anode RGB LED |
 | Privacy | SPDT mute switch on mic data line |
 
 ### Pin Mapping
@@ -154,17 +154,17 @@ static constexpr uint8_t kDetectThreshold = 200;  // ~78% confidence
 | Model tensor arena | 150 KB | PSRAM |
 | Audio task stack | 16 KB | Internal SRAM |
 | Network task stack | 8 KB | Internal SRAM |
-| TTS queue | ~13 KB | Internal SRAM |
+| TTS Buffer | 512 KB | PSRAM |
 
 ### WebSocket Protocol
 
 | Direction | Frame Type | Content |
 |---|---|---|
 | Client → Server | Text | `{"event": "wake"}` — wake word detected |
-| Client → Server | Binary | Opus-encoded 20ms audio frames |
+| Client → Server | Binary | Opus-encoded 20ms audio frames (or raw PCM) |
 | Client → Server | Text | `{"event": "stop"}` — VAD silence cutoff |
 | Server → Client | Text | `{"event": "response_start"}` |
-| Server → Client | Binary | Opus-encoded TTS audio |
+| Server → Client | Binary | Raw PCM chunks (16-bit 16kHz mono) |
 | Server → Client | Text | `{"event": "response_end"}` |
 
 ## License
