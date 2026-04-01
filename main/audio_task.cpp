@@ -113,11 +113,15 @@ static bool i2s_init_full_duplex()
         return false;
     }
 
-    // ── TX config (amplifier — 16-bit mono, Philips standard) ──
+    // ── TX config (amplifier — 32-bit stereo to match RX clock) ──
+    // CRITICAL: TX and RX share I2S_NUM_0. The clock is set by RX (32-bit
+    // stereo). TX MUST use the same slot format or the DMA rate will
+    // mismatch the serializer clock, causing garbled/silent output.
+    // We'll pack our 16-bit mono TTS data into 32-bit stereo before writing.
     i2s_std_config_t tx_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+                        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = static_cast<gpio_num_t>(kPinI2S_SCK),
@@ -142,8 +146,85 @@ static bool i2s_init_full_duplex()
     // Enable RX immediately; TX enabled on-demand during playback
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx_handle));
 
-    ESP_LOGI(TAG, "I2S full-duplex initialised: RX(stereo 32-bit) + TX(mono 16-bit)");
+    ESP_LOGI(TAG, "I2S full-duplex initialised: RX(stereo 32-bit) + TX(stereo 32-bit)");
     return true;
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Boot-time speaker self-test — 500Hz sine wave, 500ms
+//
+//  Plays a pure tone through I2S TX immediately at boot to verify
+//  the entire hardware chain: GPIO1 → MAX98357A → Speaker.
+//  If you hear the tone, hardware is good.
+//  If you hear nothing, the hardware chain is broken.
+// ═════════════════════════════════════════════════════════════════
+#include <cmath>
+
+static void play_boot_sound()
+{
+    ESP_LOGI(TAG, "=== PLAYING BOOT SOUND ===");
+
+    // Enable TX
+    esp_err_t err = i2s_channel_enable(s_tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Boot sound: TX enable failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    constexpr int DURATION_MS    = 400; // 400ms duration
+    constexpr int TOTAL_SAMPLES  = kSampleRate * DURATION_MS / 1000;
+    constexpr int CHUNK_SAMPLES  = 320;
+    constexpr float TWO_PI       = 6.283185307f;
+
+    // Frequencies for a pleasant "startup" chord (C major third)
+    constexpr float FREQ_1 = 523.25f; // C5
+    constexpr float FREQ_2 = 659.25f; // E5
+
+    int32_t stereo_buf[CHUNK_SAMPLES * 2];
+
+    int samples_written = 0;
+    while (samples_written < TOTAL_SAMPLES) {
+        int chunk_len = CHUNK_SAMPLES;
+        if (samples_written + chunk_len > TOTAL_SAMPLES) {
+            chunk_len = TOTAL_SAMPLES - samples_written;
+        }
+
+        for (int i = 0; i < chunk_len; i++) {
+            float t = static_cast<float>(samples_written + i) / kSampleRate;
+
+            // ADSR Envelope (Smooth fade in and out)
+            float envelope = 1.0f;
+            if (t < 0.05f) {
+                envelope = t / 0.05f; // 50ms fade in
+            } else if (t > 0.3f) {
+                envelope = (0.4f - t) / 0.1f; // 100ms fade out
+            }
+
+            // Mix two sine waves
+            float wave = sinf(TWO_PI * FREQ_1 * t) + sinf(TWO_PI * FREQ_2 * t);
+
+            // Scale amplitude (prevent clipping, pleasant volume)
+            int16_t sample = static_cast<int16_t>(5000.0f * wave * envelope);
+
+            int32_t s32 = static_cast<int32_t>(sample) << 16;  // MSB-justify
+            stereo_buf[i * 2]     = s32;  // Left
+            stereo_buf[i * 2 + 1] = s32;  // Right
+        }
+
+        size_t bytes_written = 0;
+        i2s_channel_write(s_tx_handle, stereo_buf,
+                          chunk_len * 2 * sizeof(int32_t),
+                          &bytes_written, portMAX_DELAY);
+        samples_written += chunk_len;
+    }
+
+    // Small silence gap to flush the DAC
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Disable TX (will be re-enabled during TTS playback)
+    i2s_channel_disable(s_tx_handle);
+
+    ESP_LOGI(TAG, "=== BOOT SOUND COMPLETE ===");
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -354,36 +435,80 @@ static void audio_task_entry(void* arg)
             break;
 
         // ─────────────────────────────────────────────────────
-        //  RESPONSE — TTS playback via I2S TX
+        //  RESPONSE — TTS playback via I2S TX from PSRAM buffer
         // ─────────────────────────────────────────────────────
         case HellumState::RESPONSE: {
-            // Try to receive a TTS chunk from the queue (non-blocking)
-            TtsChunk chunk;
-            if (xQueueReceive(ctx->tts_queue, &chunk, 0) == pdTRUE) {
-                // Enable TX if not already enabled
-                static bool tx_enabled = false;
+            static bool tx_enabled = false;
+            static int tts_chunks_played = 0;
+
+            // Read 16-bit mono PCM from TTS buffer (640 bytes = 320 samples)
+            constexpr size_t MONO_FRAME_BYTES = kOpusFrameSamples * kBytesPerSample;
+            static int16_t mono_tts[kOpusFrameSamples];
+
+            // I2S output format: 32-bit stereo = 320 samples × 2ch × 4 bytes = 2560 bytes
+            static int32_t stereo_out[kOpusFrameSamples * 2];
+            constexpr size_t STEREO32_BYTES = sizeof(stereo_out);
+
+            size_t got = ctx->tts_buffer.Read(
+                reinterpret_cast<uint8_t*>(mono_tts), MONO_FRAME_BYTES);
+
+            if (got > 0) {
                 if (!tx_enabled) {
-                    i2s_channel_enable(s_tx_handle);
+                    ESP_LOGI(TAG, "Enabling I2S TX for TTS playback (DOUT=GPIO %d)", kPinI2S_DOUT);
+                    esp_err_t en_err = i2s_channel_enable(s_tx_handle);
+                    if (en_err != ESP_OK) {
+                        ESP_LOGE(TAG, "i2s_channel_enable(TX) failed: %s", esp_err_to_name(en_err));
+                    }
                     tx_enabled = true;
+                    tts_chunks_played = 0;
                 }
 
-                // Write PCM to amplifier
-                size_t bytes_written = 0;
-                i2s_channel_write(s_tx_handle,
-                                  chunk.samples,
-                                  chunk.length * sizeof(int16_t),
-                                  &bytes_written,
-                                  portMAX_DELAY);
+                int samples_got = got / kBytesPerSample;
 
-                // Check if this was the last chunk
-                if (chunk.is_last) {
-                    // Small delay to let the DAC flush (must happen inline for UX)
+                // Zero-pad if short
+                for (int i = samples_got; i < kOpusFrameSamples; i++) {
+                    mono_tts[i] = 0;
+                }
+
+                // Convert 16-bit mono → 32-bit stereo (MSB-justified for I2S)
+                for (int i = 0; i < kOpusFrameSamples; i++) {
+                    int32_t s32 = static_cast<int32_t>(mono_tts[i]) << 16;
+                    stereo_out[i * 2]     = s32;  // Left
+                    stereo_out[i * 2 + 1] = s32;  // Right
+                }
+
+                // Trace progress
+                if (tts_chunks_played == 0 && got > 0) {
+                    ESP_LOGI(TAG, "TTS playback started -> I2S TX");
+                }
+
+                size_t bw = 0;
+                esp_err_t wr = i2s_channel_write(s_tx_handle,
+                    stereo_out, STEREO32_BYTES, &bw, portMAX_DELAY);
+
+                tts_chunks_played++;
+
+                if (wr != ESP_OK) {
+                    ESP_LOGE(TAG, "i2s_channel_write failed: %s", esp_err_to_name(wr));
+                }
+                if (tts_chunks_played % 50 == 0) {
+                    ESP_LOGI(TAG, "TTS: %d chunks (%dms), buf=%zu",
+                             tts_chunks_played, tts_chunks_played * kOpusFrameMs,
+                             ctx->tts_buffer.Available());
+                }
+            } else {
+                if (ctx->tts_buffer.stream_done.load() &&
+                    ctx->tts_buffer.Available() == 0) {
                     vTaskDelay(pdMS_TO_TICKS(100));
-                    i2s_channel_disable(s_tx_handle);
-                    tx_enabled = false;
-
-                    ESP_LOGI(TAG, "TTS playback complete");
+                    if (tx_enabled) {
+                        i2s_channel_disable(s_tx_handle);
+                        tx_enabled = false;
+                    }
+                    ESP_LOGI(TAG, "TTS playback complete (%d chunks, %dms)",
+                             tts_chunks_played, tts_chunks_played * kOpusFrameMs);
                     ctx->state.store(HellumState::POST_RESPONSE);
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(2));
                 }
             }
             break;
@@ -423,6 +548,9 @@ void audio_task_start(HellumContext* ctx)
         ESP_LOGE(TAG, "I2S init failed — cannot start audio task");
         return;
     }
+
+    // Play premium boot sound to verify speaker
+    play_boot_sound();
 
     // Create the task pinned to Core 1
     xTaskCreatePinnedToCore(

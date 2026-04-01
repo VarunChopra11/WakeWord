@@ -164,7 +164,6 @@ static void ws_event_handler(void* arg, esp_event_base_t event_base,
             // ── Handle incoming data based on opcode ──
             if (data->op_code == 0x01) {
                 // Text frame → JSON control message
-                // Check for end-of-stream marker
                 cJSON* json = cJSON_ParseWithLength(
                     static_cast<const char*>(data->data_ptr), data->data_len);
                 if (json) {
@@ -172,43 +171,35 @@ static void ws_event_handler(void* arg, esp_event_base_t event_base,
                     if (event && cJSON_IsString(event)) {
                         if (strcmp(event->valuestring, "response_start") == 0) {
                             ESP_LOGI(TAG, "Server: response_start");
+                            // Reset the TTS buffer for the new response
+                            s_ctx->tts_buffer.Reset();
                             s_ctx->state.store(HellumState::RESPONSE);
                         } else if (strcmp(event->valuestring, "response_end") == 0) {
-                            ESP_LOGI(TAG, "Server: response_end");
-                            // Push a final chunk marker
-                            TtsChunk final_chunk = {};
-                            final_chunk.length  = 0;
-                            final_chunk.is_last = true;
-                            xQueueSend(s_ctx->tts_queue, &final_chunk, portMAX_DELAY);
+                            ESP_LOGI(TAG, "Server: response_end (%zu bytes buffered)",
+                                     s_ctx->tts_buffer.Available());
+                            s_ctx->tts_buffer.stream_done.store(true);
                         }
                     }
                     cJSON_Delete(json);
                 }
             } else if (data->op_code == 0x02) {
-                // Binary frame → TTS audio data
+                // Binary frame → TTS audio data → write into PSRAM buffer
                 HellumState current = s_ctx->state.load();
                 if (current == HellumState::RESPONSE ||
                     current == HellumState::SERVER_PROCESSING) {
 
-                    // Ensure we're in RESPONSE state
                     if (current == HellumState::SERVER_PROCESSING) {
+                        s_ctx->tts_buffer.Reset();
                         s_ctx->state.store(HellumState::RESPONSE);
                     }
 
-                    // Decode the incoming audio
-                    TtsChunk chunk = {};
-                    chunk.length = decode_frame(
+                    size_t written = s_ctx->tts_buffer.Write(
                         reinterpret_cast<const uint8_t*>(data->data_ptr),
-                        data->data_len,
-                        chunk.samples,
-                        kOpusFrameSamples);
-                    chunk.is_last = false;
+                        data->data_len);
 
-                    if (chunk.length > 0) {
-                        // Non-blocking push — drop if queue full (prevents stall)
-                        if (xQueueSend(s_ctx->tts_queue, &chunk, 0) != pdTRUE) {
-                            ESP_LOGW(TAG, "TTS queue full — dropping chunk");
-                        }
+                    if (written < static_cast<size_t>(data->data_len)) {
+                        ESP_LOGW(TAG, "TTS buffer full — dropped %d bytes",
+                                 data->data_len - (int)written);
                     }
                 }
             }

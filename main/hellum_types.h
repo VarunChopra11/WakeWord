@@ -12,11 +12,13 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <atomic>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "esp_heap_caps.h"
 
 // Forward declarations
 class AudioPreprocessor;
@@ -64,8 +66,9 @@ static constexpr int kVadSilenceTimeoutMs = 800;
 static constexpr int kOpusFrameMs      = 20;
 static constexpr int kOpusFrameSamples = (kSampleRate * kOpusFrameMs) / 1000; // 320
 
-// TTS playback queue depth (number of PCM frame buffers)
-static constexpr int kTtsQueueDepth = 20;
+// TTS byte buffer in PSRAM — holds up to 4 seconds of raw PCM response audio
+// 4s × 16000 Hz × 2 bytes = 128,000 bytes
+static constexpr size_t kTtsBufferBytes = 128000;
 
 // ═════════════════════════════════════════════════════════════════
 //  State Machine
@@ -113,15 +116,64 @@ static constexpr EventBits_t BIT_ALL              = 0xFF;
 // ═════════════════════════════════════════════════════════════════
 
 /**
- * @brief PCM audio chunk for TTS playback queue.
+ * @brief PSRAM-backed byte buffer for TTS audio.
  *
- * Network task decodes Opus → fills this → pushes to tts_queue.
- * Audio task pops this → writes to I2S TX.
+ * Network task writes raw PCM bytes into this buffer.
+ * Audio task reads 640-byte (20ms) chunks from it for I2S playback.
+ * Lock-free single-producer single-consumer via atomic indices.
  */
-struct TtsChunk {
-    int16_t  samples[kOpusFrameSamples];    // 320 samples = 20ms
-    uint16_t length;                         // Actual sample count (may be < 320 at end)
-    bool     is_last;                        // Marks end of TTS stream
+struct TtsBuffer {
+    uint8_t* data       = nullptr;   // PSRAM allocation
+    size_t   capacity   = 0;         // Total bytes
+    std::atomic<size_t> write_pos{0};
+    std::atomic<size_t> read_pos{0};
+    std::atomic<bool>   stream_done{false};  // Server sent response_end
+
+    bool Init(size_t cap) {
+        data = static_cast<uint8_t*>(
+            heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!data) return false;
+        capacity = cap;
+        Reset();
+        return true;
+    }
+
+    void Reset() {
+        write_pos.store(0);
+        read_pos.store(0);
+        stream_done.store(false);
+    }
+
+    /** Producer: write raw bytes. Returns bytes actually written. */
+    size_t Write(const uint8_t* src, size_t len) {
+        size_t wp = write_pos.load(std::memory_order_relaxed);
+        size_t rp = read_pos.load(std::memory_order_acquire);
+        size_t used = wp - rp;  // works because we never wrap
+        size_t avail = capacity - used;
+        if (len > avail) len = avail;  // drop overflow silently
+        if (len == 0) return 0;
+        memcpy(data + (wp % capacity), src, len);  // linear, no wrap needed if wp < capacity
+        write_pos.store(wp + len, std::memory_order_release);
+        return len;
+    }
+
+    /** Consumer: read up to `len` bytes. Returns bytes actually read. */
+    size_t Read(uint8_t* dst, size_t len) {
+        size_t wp = write_pos.load(std::memory_order_acquire);
+        size_t rp = read_pos.load(std::memory_order_relaxed);
+        size_t available = wp - rp;
+        if (len > available) len = available;
+        if (len == 0) return 0;
+        memcpy(dst, data + (rp % capacity), len);
+        read_pos.store(rp + len, std::memory_order_release);
+        return len;
+    }
+
+    /** How many bytes are available to read. */
+    size_t Available() const {
+        return write_pos.load(std::memory_order_acquire) -
+               read_pos.load(std::memory_order_relaxed);
+    }
 };
 
 struct HellumContext {
@@ -130,7 +182,9 @@ struct HellumContext {
 
     // ── FreeRTOS Primitives ───────────────────────────────────
     EventGroupHandle_t event_group = nullptr;
-    QueueHandle_t      tts_queue   = nullptr;  // Queue of TtsChunk*
+
+    // ── TTS Buffer (replaces the old small FreeRTOS queue) ────
+    TtsBuffer          tts_buffer;
 
     // ── Shared Objects (init once, then read-only pointers) ───
     RingBuffer*        ring_buffer     = nullptr;

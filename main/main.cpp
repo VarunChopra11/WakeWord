@@ -151,12 +151,18 @@ extern "C" void app_main() {
 
   // ── 2. FreeRTOS Primitives ───────────────────────────────
   s_ctx.event_group = xEventGroupCreate();
-  s_ctx.tts_queue = xQueueCreate(kTtsQueueDepth, sizeof(TtsChunk));
-  if (!s_ctx.event_group || !s_ctx.tts_queue) {
-    ESP_LOGE(TAG, "Failed to create FreeRTOS primitives — halting");
+  if (!s_ctx.event_group) {
+    ESP_LOGE(TAG, "Failed to create event group — halting");
     esp_restart();
   }
-  ESP_LOGI(TAG, "[2/7] FreeRTOS primitives created");
+
+  // ── 2b. TTS Buffer (PSRAM) ──────────────────────────────
+  if (!s_ctx.tts_buffer.Init(kTtsBufferBytes)) {
+    ESP_LOGE(TAG, "Failed to allocate TTS buffer in PSRAM — halting");
+    esp_restart();
+  }
+  ESP_LOGI(TAG, "[2/7] FreeRTOS + TTS buffer (%zu KB PSRAM) created",
+           kTtsBufferBytes / 1024);
 
   // ── 3. Ring Buffer (PSRAM) ───────────────────────────────
   s_ctx.ring_buffer = new RingBuffer(kRingBufferSamples);
